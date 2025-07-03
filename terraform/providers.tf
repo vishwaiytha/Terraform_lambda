@@ -10,4 +10,10 @@ terraform {
       version = "~> 5.0"
     }
   }
+ backend "s3" {
+    bucket  = "my-terraform-statefilestore" 
+    key     = "ec2/terraform.tfstate"           
+    region  = "us-east-2"
+    encrypt = true
+  }
 }
