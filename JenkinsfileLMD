@@ -1,0 +1,120 @@
+pipeline {
+    agent any
+    
+    environment {
+        PACKAGE_VERSION = "${env.BUILD_NUMBER}"
+        TEMP_DIR = "/tmp/lambda_build_${env.BUILD_NUMBER}"
+    }
+    
+    parameters {
+        choice(
+            choices: ['dev'],
+            description: 'Choose deployment environment',
+            name: 'ENV'
+        )
+    }
+    
+    stages {
+        stage('Clean Workspace') {
+            steps {
+                cleanWs()
+            }
+        }
+
+        stage('Git Clone') {
+            steps {
+                checkout([$class: 'GitSCM',
+                    branches: [[name: 'main']],
+                    doGenerateSubmoduleConfigurations: false,
+                    extensions: [], 
+                    submoduleCfg: [],
+                    userRemoteConfigs: [[
+                        credentialsId: 'Github_creds',
+                        url: 'https://github.com/vishwaiytha/Terraform_lambda.git'
+                    ]]
+                ])
+            }
+        }
+
+        stage('Select AWS Account') {
+            steps {
+                script {
+                    env.S3_BUCKET = 'your-lambda-dev-deployments'
+                    env.AWS_CREDENTIALS_ID = 'aws-dev-credentials'
+                    
+                    echo "Selected environment: dev"
+                    echo "S3 Bucket: ${env.S3_BUCKET}"
+                }
+            }
+        }
+
+        stage('Build Lambda Package') {
+            when {
+                expression { env.BRANCH_NAME == 'main' }
+            }
+            steps {
+                sh """
+                    # Install dependencies and build
+                    npm install
+                    
+                    # Create deployment package
+                    mkdir -p dist
+                    zip -r dist/lambda-function-${PACKAGE_VERSION}.zip lambda/ node_modules/
+                    
+                    echo "Lambda package created: lambda-function-${PACKAGE_VERSION}.zip"
+                """
+            }
+        }
+
+        stage('Upload to S3') {
+            when {
+                expression { env.BRANCH_NAME == 'main' }
+            }
+            steps {
+                script {
+                    def commitId = sh(script: "git rev-parse --short HEAD", returnStdout: true).trim()
+                    env.BUILD_VERSION = "${env.BUILD_NUMBER}-${commitId}"
+                }
+                
+                withAWS(credentials: "${env.AWS_CREDENTIALS_ID}", region: 'us-east-1') {
+                    s3Upload(
+                        bucket: "${env.S3_BUCKET}",
+                        path: "lambda-function-${PACKAGE_VERSION}.zip",
+                        file: "dist/lambda-function-${PACKAGE_VERSION}.zip"
+                    )
+                    echo "Lambda package uploaded to S3: ${env.S3_BUCKET}/lambda-function-${PACKAGE_VERSION}.zip"
+                }
+            }
+        }
+
+        stage('Deploy to Dev') {
+            when {
+                expression { env.BRANCH_NAME == 'main' }
+            }
+            steps {
+                withAWS(credentials: "${env.AWS_CREDENTIALS_ID}", region: 'us-east-1') {
+                    sh """
+                        cd terraform
+                        terraform init -reconfigure -backend-config=dev-backend-config.tfvars
+                        terraform validate
+                        terraform plan -var-file="terraform.tfvars" -var "lambda_version=${PACKAGE_VERSION}"
+                        terraform apply -var-file="terraform.tfvars" -var "lambda_version=${PACKAGE_VERSION}" -auto-approve
+                    """
+                }
+            }
+        }
+    }
+    
+    post {
+        always {
+            // Clean up temp directory
+            sh "rm -rf ${env.TEMP_DIR}"
+        }
+        success {
+            echo "Deployment to dev completed successfully!"
+        }
+        failure {
+            echo "Deployment to dev failed!"
+        }
+    }
+}
